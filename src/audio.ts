@@ -1,8 +1,11 @@
 ﻿import type { DrumPattern, DrumStyle } from './patterns'
+import { bassMidi, type BassMode, type BassScale } from './bassPatterns'
+import { BASS_VOICES } from './bassVoices'
 
 import { DRUM_KITS } from './drumKits'
 
-type PlaybackData = { bpm: number; drum: DrumPattern; volume: number; swing: number; human: number; style: DrumStyle }
+type BassData = { notes: (number | null)[]; accents: number[]; lengths: number[]; root: string; scale: BassScale; cutoff: number; resonance: number; decay: number; drive: number; volume: number; mode?: BassMode }
+type PlaybackData = { bpm: number; drum: DrumPattern; volume: number; swing: number; human: number; style: DrumStyle; bass?: BassData; muted?: { drum: boolean; bass: boolean; synth?: boolean } }
 type StepEvent = { step: number; time: number }
 
 /** One clock for the whole instrument. Scheduled steps read live state on each tick. */
@@ -10,6 +13,9 @@ export class DrumEngine {
   private context: AudioContext | null = null
   private output: GainNode | null = null
   private limiter: WaveShaperNode | null = null
+  private bassOutput: GainNode | null = null
+  private bassEnvelope: GainNode | null = null
+  private bassVoices = new Map<GainNode, {osc: OscillatorNode; start: number}>()
   private timer: ReturnType<typeof setInterval> | null = null
   private animation: number | null = null
   private active = false
@@ -21,24 +27,35 @@ export class DrumEngine {
 
   constructor(private read: () => PlaybackData, private onStep: (step: number | null) => void) {}
 
+  async ensureContext() {
+    const context = this.context ?? new AudioContext()
+    this.context = context
+    if (context.state !== 'running') await context.resume()
+    if (context.state !== 'running') throw new Error('No se pudo iniciar el audio')
+    return context
+  }
+
   async start() {
     if (this.active) return
     this.active = true
     const generation = ++this.generation
     try {
-      const context = this.context ?? new AudioContext()
-      this.context = context
-      if (context.state !== 'running') await context.resume()
+      const context = await this.ensureContext()
       if (!this.active || generation !== this.generation) return
       if (context.state !== 'running') throw new Error('El navegador no pudo iniciar el audio. Tocá PLAY otra vez.')
       this.output = context.createGain()
-      this.output.gain.value = Math.max(0, Math.min(1, this.read().volume / 100)) * .7
+      this.output.gain.value = this.read().muted?.drum ? 0 : Math.max(0, Math.min(1, this.read().volume / 100)) * .7
       // Bound peaks even when several saturated voices hit at once.
       this.limiter = context.createWaveShaper()
       const limitCurve = new Float32Array(2049)
       for (let i = 0; i < limitCurve.length; i++) limitCurve[i] = Math.tanh((i / 1024 - 1) * 1.4) * .9
       this.limiter.curve = limitCurve
       this.output.connect(this.limiter).connect(context.destination)
+      if (this.read().bass) {
+        this.bassOutput = context.createGain()
+        this.bassOutput.gain.value = this.read().muted?.bass ? 0 : Math.max(0, Math.min(1, this.read().bass!.volume / 100)) * .38
+        this.bassOutput.connect(this.limiter)
+      }
       this.nextStep = 0
       this.nextTime = context.currentTime + .05
       this.queue = []
@@ -63,18 +80,46 @@ export class DrumEngine {
     if (this.output && this.context) {
       const output = this.output
       const limiter = this.limiter
+      const bassOutput = this.bassOutput
+      if (bassOutput) { bassOutput.gain.cancelScheduledValues(this.context.currentTime); bassOutput.gain.setTargetAtTime(0, this.context.currentTime, .008) }
+      this.bassOutput = null
+      this.bassEnvelope = null
+      this.bassVoices.clear()
       output.gain.cancelScheduledValues(this.context.currentTime)
       output.gain.setValueAtTime(0, this.context.currentTime)
       // Let already scheduled voices finish before disconnecting their silent bus.
-      setTimeout(() => { output.disconnect(); limiter?.disconnect() }, 1000)
+      setTimeout(() => { output.disconnect(); bassOutput?.disconnect(); limiter?.disconnect() }, 4000)
       this.output = null
       this.limiter = null
     }
     this.onStep(null)
   }
 
-  setVolume(volume: number) {
-    if (this.output && this.context) this.output.gain.setTargetAtTime(Math.max(0, Math.min(1, volume / 100)) * .7, this.context.currentTime, .015)
+  setVolume(volume: number, muted = false) {
+    if (this.output && this.context) this.output.gain.setTargetAtTime(muted ? 0 : Math.max(0, Math.min(1, volume / 100)) * .7, this.context.currentTime, .015)
+  }
+
+  setBassVolume(volume: number, muted = false) {
+    if (this.bassOutput && this.context) this.bassOutput.gain.setTargetAtTime(muted ? 0 : Math.max(0, Math.min(1, volume / 100)) * .38, this.context.currentTime, .015)
+  }
+
+  setMute(module: 'drum' | 'bass', muted: boolean, volume: number) {
+    if (module === 'drum') this.setVolume(volume, muted)
+    else {
+      this.setBassVolume(volume, muted)
+      if (muted && this.context) {
+        // Cancel every current and lookahead-scheduled note so it cannot return on unmute.
+        const now = this.context.currentTime
+        for (const [envelope, voice] of this.bassVoices) {
+          if (typeof envelope.gain.cancelAndHoldAtTime === 'function') envelope.gain.cancelAndHoldAtTime(now)
+          else envelope.gain.cancelScheduledValues(now)
+          envelope.gain.setTargetAtTime(.0001, now, .004)
+          // A not-yet-started lookahead note must not reappear on a quick unmute.
+          voice.osc.stop(voice.start > now ? now : now + .06)
+        }
+        this.bassEnvelope = null
+      }
+    }
   }
 
   dispose() {
@@ -101,6 +146,9 @@ export class DrumEngine {
       for (let row = 0; row < 4; row++) {
         if (data.drum[row]?.[step]) this.voice(row, step, time, data.style, data.human)
       }
+      const bass = data.bass
+      const note = bass?.notes[step]
+      if (bass && note != null && !data.muted?.bass) this.bassVoice(note, step, time, stepDuration, bass)
       this.nextTime += stepDuration
       this.nextStep = (step + 1) % 16
     }
@@ -112,6 +160,53 @@ export class DrumEngine {
     while (this.queue.length && this.queue[0].time <= this.context.currentTime) event = this.queue.shift()
     if (event) this.onStep(event.step)
     this.animation = requestAnimationFrame(this.draw)
+  }
+
+  private bassVoice(row: number, step: number, time: number, stepDuration: number, data: BassData) {
+    const ctx = this.context!
+    const output = this.bassOutput
+    if (!output) return
+    // A new note releases the previous voice even if its original gate was longer.
+    if (this.bassEnvelope) {
+      this.bassEnvelope.gain.cancelScheduledValues(time)
+      this.bassEnvelope.gain.setTargetAtTime(.0001, time, .004)
+    }
+    const clamp = (value: number) => Math.max(0, Math.min(100, value)) / 100
+    const voice = BASS_VOICES[data.mode ?? 'PULSE']
+    const accent = data.accents.includes(step)
+    const gate = Math.max(1, Math.min(16, data.lengths[step] || 1)) * stepDuration * .85 * voice.gate
+    const osc = ctx.createOscillator()
+    const filter = ctx.createBiquadFilter()
+    const distortion = ctx.createWaveShaper()
+    const env = ctx.createGain()
+    this.bassEnvelope = env
+    this.bassVoices.set(env, {osc, start: time})
+    osc.onended = () => { this.bassVoices.delete(env); if (this.bassEnvelope === env) this.bassEnvelope = null }
+    osc.type = voice.wave
+    const frequency = 440 * Math.pow(2, (bassMidi(data.root, data.scale, row) - 69) / 12)
+    // CHAOS bends by a small, repeatable number of cents, never a different note.
+    const cents = voice.pitchOffset * (step % 3 - 1)
+    osc.frequency.setValueAtTime(frequency * Math.pow(2, cents / 1200), time)
+    if (cents) osc.frequency.setTargetAtTime(frequency, time + .008, .08)
+    filter.type = 'lowpass'
+    const cutoff = 110 * Math.pow(22, clamp(data.cutoff)) * voice.cutoff
+    filter.frequency.setValueAtTime(cutoff * voice.filterAttack * (accent ? 1.55 : 1), time)
+    filter.frequency.setTargetAtTime(cutoff, time + .01, .09)
+    filter.Q.value = .6 + clamp(data.resonance) * 8 * voice.resonance
+    const amount = 1 + voice.drive + clamp(data.drive) * 3
+    const curve = new Float32Array(1025)
+    for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh((i / 512 - 1) * amount) / Math.tanh(amount) * .65
+    distortion.curve = curve
+    osc.connect(filter).connect(distortion).connect(env).connect(output)
+    const level = (accent ? .85 : .52) * voice.level
+    const decay = (.06 + clamp(data.decay) * .5) * voice.decay
+    const attack = Math.min(voice.attack, gate * .45)
+    env.gain.setValueAtTime(.0001, time)
+    env.gain.exponentialRampToValueAtTime(level, time + attack)
+    env.gain.setTargetAtTime(level * voice.sustain, time + attack, decay)
+    env.gain.setTargetAtTime(.0001, time + gate, .025)
+    osc.start(time)
+    osc.stop(time + gate + .2)
   }
 
   private noiseBuffer(ctx: AudioContext) {
