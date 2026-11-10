@@ -11,14 +11,18 @@ const {create,act}=require('react-test-renderer')
 const App=require('../src/App.tsx').default
 const {SYNTH_DEFAULTS}=require('../src/synthParams.ts')
 let timers=new Map(), id=0, starts=0, currentContext
-const original={setInterval:global.setInterval,clearInterval:global.clearInterval,requestAnimationFrame:global.requestAnimationFrame,cancelAnimationFrame:global.cancelAnimationFrame,AudioContext:global.AudioContext}
+const original={setInterval:global.setInterval,clearInterval:global.clearInterval,requestAnimationFrame:global.requestAnimationFrame,cancelAnimationFrame:global.cancelAnimationFrame,AudioContext:global.AudioContext,fetch:global.fetch}
+let finishSamples
+let bassFailure = false
+const samplesPending=new Promise(resolve=>{finishSamples=resolve})
+global.fetch=async url=>{await samplesPending;return {ok:!url.endsWith('/glitch/snare.wav') && !(bassFailure && url.includes('/bass/')),arrayBuffer:async()=>new ArrayBuffer(1)}}
 global.setInterval=fn=>{const n=++id;timers.set(n,fn);return n}
 global.clearInterval=n=>timers.delete(n)
 global.requestAnimationFrame=()=>++id
 global.cancelAnimationFrame=()=>{}
 class Param{constructor(){this.value=0}setValueAtTime(v){this.value=v}exponentialRampToValueAtTime(){}setTargetAtTime(){}cancelScheduledValues(){}}
 class Node{constructor(){this.gain=new Param();this.frequency=new Param();this.Q=new Param();this.delayTime=new Param();this.threshold=new Param();this.knee=new Param();this.ratio=new Param();this.attack=new Param();this.release=new Param();this.stops=0}connect(node){return node}disconnect(){}start(){starts++}stop(){this.stops++}}
-class Context{constructor(){this.currentTime=0;this.sampleRate=48000;this.state='suspended';this.destination=new Node();this.oscs=[];currentContext=this}async resume(){this.state='running'}async close(){this.state='closed'}createGain(){return new Node()}createOscillator(){const n=new Node();this.oscs.push(n);return n}createBufferSource(){return new Node()}createBiquadFilter(){return new Node()}createWaveShaper(){return new Node()}createDelay(){return new Node()}createConvolver(){return new Node()}createDynamicsCompressor(){return new Node()}createBuffer(_,length){return {getChannelData:()=>new Float32Array(length)}}}
+class Context{constructor(){this.currentTime=0;this.sampleRate=48000;this.state='suspended';this.destination=new Node();this.oscs=[];currentContext=this}async resume(){this.state='running'}async close(){this.state='closed'}async decodeAudioData(){return {duration:.3}}createGain(){return new Node()}createOscillator(){const n=new Node();this.oscs.push(n);return n}createBufferSource(){return new Node()}createBiquadFilter(){return new Node()}createWaveShaper(){return new Node()}createDelay(){return new Node()}createConvolver(){return new Node()}createDynamicsCompressor(){return new Node()}createBuffer(_,length){return {getChannelData:()=>new Float32Array(length)}}}
 global.AudioContext=Context
 async function run(){
  let app
@@ -31,6 +35,20 @@ async function run(){
  const surface={getBoundingClientRect:()=>({left:0,top:0,width:400,height:200}),setPointerCapture:()=>{}}
  const event=(id,x=100,y=100)=>({pointerId:id,pointerType:'touch',button:0,clientX:x,clientY:y,currentTarget:surface,preventDefault(){}})
  assert.equal(currentContext,undefined,'rendering the static does not start audio')
+ const rowSteps=label=>Array.from({length:16},(_,i)=>find({'aria-label':`${label}, paso ${i+1}`}).props['aria-pressed'])
+ const kickBeforeClear=rowSteps('KICK')
+ assert(rowSteps('SNARE').some(Boolean))
+ await act(async()=>{find({'aria-label':'Limpiar fila SNARE'}).props.onClick()})
+ assert(rowSteps('SNARE').every(value=>!value),'CLEAR empties a row while stopped in rack view')
+ assert.deepEqual(rowSteps('KICK'),kickBeforeClear,'CLEAR preserves other rows')
+ for (const label of ['HAT','PERC']) {
+  const remaining=['KICK','SNARE','HAT','PERC'].filter(name=>name!==label)
+  const before=remaining.map(rowSteps)
+  assert(rowSteps(label).some(Boolean))
+  await act(async()=>{find({'aria-label':`Limpiar fila ${label}`}).props.onClick()})
+  assert(rowSteps(label).every(value=>!value),`CLEAR empties ${label}`)
+  assert.deepEqual(remaining.map(rowSteps),before,`CLEAR ${label} preserves the other rows`)
+ }
  await act(async()=>{find({'aria-label':'Sonido del pad'}).props.onChange({target:{value:'NOISE'}})})
  assert.equal(currentContext,undefined,'selecting noise does not start audio')
  const bassStep=find({'aria-label':'BASS C, paso 1'}).props['aria-pressed']
@@ -176,6 +194,26 @@ async function run(){
  await act(async()=>{find({'aria-label':'Bloquear KICK para RANDOM'}).props.onClick()})
  await act(async()=>{find({'aria-label':'Estilo de batería'}).props.onChange({target:{value:'GLITCH'}})})
  assert.equal(find({'aria-label':'KICK, paso 2'}).props['aria-pressed'],true,'changing style keeps the current pattern')
+ assert(find({className:'kit-status loading'}).children.join('').includes('CARGANDO SAMPLES'),'loading state is visible')
+ await act(async()=>{finishSamples();await samplesPending})
+ const kitError=find({className:'kit-status error'}).children.join('')
+ assert(kitError.includes('snare.wav') && kitError.includes('SONIDO SINTETIZADO'),'missing file and fallback are visible')
+ const styleSelect=()=>find({'aria-label':'Estilo de batería'})
+ assert(styleSelect().findAllByType('option').some(option=>option.props.value==='TRIP-HOP' && option.children.join('')==='TRIP'),'TRIP is the visible name')
+ const beforeTrip=['KICK','SNARE','HAT','PERC'].map(rowSteps)
+ await act(async()=>{styleSelect().props.onChange({target:{value:'TRIP-HOP'}})})
+ assert(find({className:'kit-status ready'}).children.join('').includes('TRIP: SAMPLES LISTOS'),'TRIP has its own ready status')
+ assert.deepEqual(['KICK','SNARE','HAT','PERC'].map(rowSteps),beforeTrip,'switching kits preserves the pattern')
+ assert.equal(timers.size,1,'switching kits preserves playback')
+ const otherRows=['SNARE','HAT','PERC'].map(rowSteps)
+ await act(async()=>{find({'aria-label':'Limpiar fila KICK'}).props.onClick()})
+ assert(rowSteps('KICK').every(value=>!value),'CLEAR empties a locked row during playback in expanded view')
+ assert.deepEqual(['SNARE','HAT','PERC'].map(rowSteps),otherRows,'clearing locked KICK preserves other rows')
+ assert.equal(find({'aria-label':'Desbloquear KICK para RANDOM'}).props['aria-pressed'],true,'CLEAR keeps LOCK enabled')
+ assert.equal(timers.size,1,'CLEAR does not stop the clock')
+ await act(async()=>{button('RANDOM').props.onClick()})
+ assert(rowSteps('KICK').every(value=>!value),'RANDOM preserves a cleared locked row')
+ await act(async()=>{find({'aria-label':'KICK, paso 2'}).props.onClick()})
  await act(async()=>{find({'aria-label':'Semilla del patrón DRUM'}).props.onChange({target:{value:'TEST'}})})
  const repeat=()=>app.root.findAllByType('button').find(x=>x.children.includes('REPETIR'))
  const pattern=()=>['KICK','SNARE','HAT','PERC'].map(row=>Array.from({length:16},(_,i)=>find({'aria-label':`${row}, paso ${i+1}`}).props['aria-pressed']))
@@ -195,6 +233,11 @@ async function run(){
  const bassBefore=app.root.findAll(x=>x.type==='button' && typeof x.props['aria-label']==='string' && x.props['aria-label'].startsWith('BASS ') && x.props['aria-label'].includes('paso')).map(x=>x.props['aria-pressed'])
  await act(async()=>{find({'aria-label':'Modo del bajo'}).props.onChange({target:{value:'DIRTY'}})})
  assert.deepEqual(app.root.findAll(x=>x.type==='button' && typeof x.props['aria-label']==='string' && x.props['aria-label'].startsWith('BASS ') && x.props['aria-label'].includes('paso')).map(x=>x.props['aria-pressed']),bassBefore,'changing bass mode keeps the pattern')
+ assert(find({className:'kit-status ready'}).children.join('').includes('DIRTY: SAMPLE LISTO'),'BASS sample readiness is visible')
+ bassFailure=true
+ await act(async()=>{find({'aria-label':'Modo del bajo'}).props.onChange({target:{value:'CHAOS'}})})
+ const bassError=find({className:'kit-status error'}).children.join('')
+ assert(bassError.includes('A04_bass-jungle-1.wav') && bassError.includes('SONIDO SINTETIZADO'),'BASS sample failure identifies the file and fallback')
  await act(async()=>{find({'aria-label':'MUTE BASS'}).props.onClick()})
  assert.equal(find({'aria-label':'MUTE BASS'}).props['aria-pressed'],false)
  await act(async()=>{app.root.findAllByType('button').find(x=>x.children.some(c=>c && c.type==='span' && c.children.includes('VOLVER AL RACK'))).props.onClick()})

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { DrumEngine } from './audio'
+import { DrumEngine, type SampledDrumStyle, type SampleKitStatus } from './audio'
 import { generateDrumPattern, type DrumStyle } from './patterns'
 import { generateBassPattern, type BassMode, type BassScale } from './bassPatterns'
 import { SynthPadEngine, PAD_MAX_LAYERS, padMidi, type PadPoint, type PadPreset } from './synthPad'
 import { SYNTH_DEFAULTS, type SynthControls } from './synthParams'
+import { BASS_SAMPLES, type SampledBassMode, type BassSampleStatus } from './bassSamples'
 
 export type ModuleName = 'synth' | 'drum' | 'bass'
 const initialDrum = [[0,4,8,12],[4,12,15],[2,6,9,10,14],[3,9,12]].map(row => Array.from({length:16},(_,i) => row.includes(i)))
@@ -17,11 +18,13 @@ export function useRackState() {
   const [drum, setDrum] = useState(initialDrum)
   const [bass, setBass] = useState<(number | null)[]>(initialBass)
   const [bassLengths, setBassLengths] = useState<number[]>(Array(16).fill(1))
-  const [bassMode, setBassMode] = useState<BassMode>('PULSE')
+  const [bassMode, setBassModeState] = useState<BassMode>('PULSE')
+  const [bassSampleStatuses, setBassSampleStatuses] = useState<Partial<Record<SampledBassMode, BassSampleStatus>>>({})
   const [bassSeed, setBassSeed] = useState('B41F')
   const [accents, setAccents] = useState([0,3,8,12])
   const [locked, setLocked] = useState<number[]>([])
-  const [style, setStyle] = useState<DrumStyle>('BROKEN')
+  const [style, setStyleState] = useState<DrumStyle>('BROKEN')
+  const [sampleStatuses, setSampleStatuses] = useState<Partial<Record<SampledDrumStyle, SampleKitStatus>>>({})
   const [seed, setSeed] = useState('A41F')
   const [currentStep, setCurrentStep] = useState<number | null>(null)
   const [audioError, setAudioError] = useState('')
@@ -50,8 +53,28 @@ export function useRackState() {
   const gestureMode = useRef<'TOUCH' | 'HOLD'>('TOUCH')
   const padSettings = {...synthControls, root, scale, preset:padPreset, volume:values['synth-VOLUMEN']}
   const getEngine = () => {
-    if (!engine.current) engine.current = new DrumEngine(() => latest.current, setCurrentStep)
+    if (!engine.current) engine.current = new DrumEngine(() => latest.current, setCurrentStep,
+      (mode, status) => setBassSampleStatuses(old => ({...old, [mode]:status})))
     return engine.current
+  }
+  const setStyle = (next: DrumStyle) => {
+    setStyleState(next)
+    if (next === 'GLITCH' || next === 'TRIP-HOP') {
+      const player = getEngine()
+      setSampleStatuses(old => old[next] ? old : {...old, [next]: {state:'loading', failed:[]}})
+      void player.loadSampleKit(next).then(status => {
+        if (engine.current === player) setSampleStatuses(old => ({...old, [next]: status}))
+      })
+    }
+  }
+  const setBassMode = (next: BassMode) => {
+    setBassModeState(next)
+    if (next === 'PULSE') return
+    const player = getEngine()
+    setBassSampleStatuses(old => old[next] ? old : {...old, [next]: {state:'loading', file:BASS_SAMPLES[next].file}})
+    void player.loadBassSample(next).then(status => {
+      if (engine.current === player) setBassSampleStatuses(old => ({...old, [next]:status}))
+    })
   }
   const getPad = () => {
     if (!pad.current) pad.current = new SynthPadEngine(() => getEngine().ensureContext(), padSettings,
@@ -110,8 +133,9 @@ export function useRackState() {
   const repeatBass = () => generateBass(bassSeed)
   const randomizeBass = () => { const next = Math.floor(Math.random() * 0x100000000).toString(16).toUpperCase().padStart(8, '0'); setBassSeed(next); generateBass(next) }
   const toggleDrum = (row:number,step:number) => setDrum(old => old.map((r,i) => i === row ? r.map((v,j) => j === step ? !v : v) : r))
+  const clearDrumRow = (row:number) => setDrum(old => old.map((r,i) => i === row ? r.map(() => false) : r))
   const toggleBass = (row:number,step:number) => { setBass(old => old.map((v,i) => i === step ? (v === row ? null : row) : v)); setBassLengths(old => old.map((v,i) => i === step ? 1 : v)) }
   const toggleAccent = (step:number) => setAccents(old => old.includes(step) ? old.filter(n=>n!==step) : [...old,step])
-  return {view,setView,playing,togglePlay,stop,muted,toggleMute,currentStep,audioError,seed,setSeed,repeatDrum,randomizeDrum,bpm,setBpm,padPreset,setPadPreset,synthControls,setSynthControl,synthSection,setSynthSection,padMode,changePadMode,padPoint,padSounding:padLayers>0,padLayers,padNotice,padBegin,padMove,padEnd,padClear,padCancel,drum,toggleDrum,bass,toggleBass,bassLengths,bassMode,setBassMode,bassSeed,setBassSeed,repeatBass,randomizeBass,accents,toggleAccent,locked,setLocked,style,setStyle,root,setRoot,scale,setScale,values,setValues}
+  return {view,setView,playing,togglePlay,stop,muted,toggleMute,currentStep,audioError,seed,setSeed,repeatDrum,randomizeDrum,bpm,setBpm,padPreset,setPadPreset,synthControls,setSynthControl,synthSection,setSynthSection,padMode,changePadMode,padPoint,padSounding:padLayers>0,padLayers,padNotice,padBegin,padMove,padEnd,padClear,padCancel,drum,toggleDrum,clearDrumRow,bass,toggleBass,bassLengths,bassMode,setBassMode,bassSampleStatuses,bassSeed,setBassSeed,repeatBass,randomizeBass,accents,toggleAccent,locked,setLocked,style,setStyle,sampleStatuses,root,setRoot,scale,setScale,values,setValues}
 }
 export type RackState = ReturnType<typeof useRackState>

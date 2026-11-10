@@ -1,12 +1,19 @@
 ﻿import type { DrumPattern, DrumStyle } from './patterns'
 import { bassMidi, type BassMode, type BassScale } from './bassPatterns'
 import { BASS_VOICES } from './bassVoices'
+import { BASS_SAMPLES, type SampledBassMode, type BassSampleStatus } from './bassSamples'
 
 import { DRUM_KITS } from './drumKits'
 
 type BassData = { notes: (number | null)[]; accents: number[]; lengths: number[]; root: string; scale: BassScale; cutoff: number; resonance: number; decay: number; drive: number; volume: number; mode?: BassMode }
 type PlaybackData = { bpm: number; drum: DrumPattern; volume: number; swing: number; human: number; style: DrumStyle; bass?: BassData; muted?: { drum: boolean; bass: boolean; synth?: boolean } }
 type StepEvent = { step: number; time: number }
+const SAMPLE_KITS = {
+  GLITCH: { directory: 'glitch', files: ['kick.wav', 'snare.wav', 'hat.wav', 'perc.wav'] },
+  'TRIP-HOP': { directory: 'trip', files: ['kick.wav', 'snare.wav', 'hat.wav', 'perc.wav'] },
+} as const
+export type SampledDrumStyle = keyof typeof SAMPLE_KITS
+export type SampleKitStatus = { state: 'loading' | 'ready' | 'error'; failed: string[] }
 
 /** One clock for the whole instrument. Scheduled steps read live state on each tick. */
 export class DrumEngine {
@@ -15,7 +22,7 @@ export class DrumEngine {
   private limiter: WaveShaperNode | null = null
   private bassOutput: GainNode | null = null
   private bassEnvelope: GainNode | null = null
-  private bassVoices = new Map<GainNode, {osc: OscillatorNode; start: number}>()
+  private bassVoices = new Map<GainNode, {source: AudioScheduledSourceNode; start: number}>()
   private timer: ReturnType<typeof setInterval> | null = null
   private animation: number | null = null
   private active = false
@@ -24,8 +31,57 @@ export class DrumEngine {
   private nextStep = 0
   private queue: StepEvent[] = []
   private noise: AudioBuffer | null = null
+  private sampleBuffers: Partial<Record<SampledDrumStyle, (AudioBuffer | null)[]>> = {}
+  private sampleLoads: Partial<Record<SampledDrumStyle, Promise<SampleKitStatus>>> = {}
+  private bassSamples: Partial<Record<SampledBassMode, AudioBuffer>> = {}
+  private bassLoads: Partial<Record<SampledBassMode, Promise<BassSampleStatus>>> = {}
 
-  constructor(private read: () => PlaybackData, private onStep: (step: number | null) => void) {}
+  constructor(private read: () => PlaybackData, private onStep: (step: number | null) => void,
+    private onBassSampleError?: (mode: SampledBassMode, status: BassSampleStatus) => void) {}
+
+  loadBassSample(mode: SampledBassMode): Promise<BassSampleStatus> {
+    const existing = this.bassLoads[mode]
+    if (existing) return existing
+    const {file} = BASS_SAMPLES[mode]
+    const load: Promise<BassSampleStatus> = (async () => {
+      try {
+        const context = this.context ?? new AudioContext()
+        this.context = context
+        const response = await fetch(`samples/bass/${encodeURIComponent(file)}`)
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        const buffer = await context.decodeAudioData(await response.arrayBuffer())
+        if (!(buffer.duration > 0)) throw new Error('Empty audio')
+        if (this.context === context) this.bassSamples[mode] = buffer
+        return {state:'ready', file}
+      } catch { return {state:'error', file} }
+    })()
+    this.bassLoads[mode] = load
+    return load
+  }
+
+  /** Fetch and decode once per engine, including partial failures. Playback never waits. */
+  loadSampleKit(style: SampledDrumStyle): Promise<SampleKitStatus> {
+    const existing = this.sampleLoads[style]
+    if (existing) return existing
+    const kit = SAMPLE_KITS[style]
+    const load: Promise<SampleKitStatus> = (async () => {
+      const context = this.context ?? new AudioContext()
+      this.context = context
+      const buffers = await Promise.all(kit.files.map(async file => {
+        try {
+          const response = await fetch(`samples/drums/${kit.directory}/${encodeURIComponent(file)}`)
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          return await context.decodeAudioData(await response.arrayBuffer())
+        } catch { return null }
+      }))
+      // Make the kit available together; a failed row keeps its synthesized voice.
+      if (this.context === context) this.sampleBuffers[style] = buffers
+      const failed = kit.files.filter((_, index) => !buffers[index])
+      return { state: failed.length ? 'error' : 'ready', failed } as SampleKitStatus
+    })().catch(() => ({ state: 'error', failed: [...kit.files] }))
+    this.sampleLoads[style] = load
+    return load
+  }
 
   async ensureContext() {
     const context = this.context ?? new AudioContext()
@@ -115,7 +171,7 @@ export class DrumEngine {
           else envelope.gain.cancelScheduledValues(now)
           envelope.gain.setTargetAtTime(.0001, now, .004)
           // A not-yet-started lookahead note must not reappear on a quick unmute.
-          voice.osc.stop(voice.start > now ? now : now + .06)
+          voice.source.stop(voice.start > now ? now : now + .06)
         }
         this.bassEnvelope = null
       }
@@ -127,6 +183,8 @@ export class DrumEngine {
     if (this.context && this.context.state !== 'closed') void this.context.close()
     this.context = null
     this.noise = null
+    this.sampleBuffers = {}
+    this.bassSamples = {}
   }
 
   private schedule() {
@@ -175,19 +233,40 @@ export class DrumEngine {
     const voice = BASS_VOICES[data.mode ?? 'PULSE']
     const accent = data.accents.includes(step)
     const gate = Math.max(1, Math.min(16, data.lengths[step] || 1)) * stepDuration * .85 * voice.gate
-    const osc = ctx.createOscillator()
+    const mode = data.mode ?? 'PULSE'
+    const sampledMode = mode === 'PULSE' ? null : mode
+    const sample = sampledMode ? this.bassSamples[sampledMode] : undefined
+    let source: OscillatorNode | AudioBufferSourceNode
+    if (sample && sampledMode) {
+      const player = ctx.createBufferSource()
+      player.buffer = sample
+      // Loop an integer number of measured cycles to sustain long notes.
+      const referenceHz = BASS_SAMPLES[sampledMode].referenceHz
+      const loopStart = Math.min(.2, sample.duration * .2)
+      const loopLimit = Math.min(loopStart + .5, sample.duration - .02)
+      const cycles = Math.floor((loopLimit - loopStart) * referenceHz)
+      if (cycles >= 1) { player.loop = true; player.loopStart = loopStart; player.loopEnd = loopStart + cycles / referenceHz }
+      const targetHz = 440 * Math.pow(2, (bassMidi(data.root, data.scale, row) - 69) / 12)
+      const cents = voice.pitchOffset * (step % 3 - 1)
+      player.playbackRate.setValueAtTime(targetHz / referenceHz * Math.pow(2, cents / 1200), time)
+      if (cents) player.playbackRate.setTargetAtTime(targetHz / referenceHz, time + .008, .08)
+      source = player
+    } else {
+      const osc = ctx.createOscillator()
+      osc.type = voice.wave
+      const frequency = 440 * Math.pow(2, (bassMidi(data.root, data.scale, row) - 69) / 12)
+      // CHAOS bends by a small, repeatable number of cents, never a different note.
+      const cents = voice.pitchOffset * (step % 3 - 1)
+      osc.frequency.setValueAtTime(frequency * Math.pow(2, cents / 1200), time)
+      if (cents) osc.frequency.setTargetAtTime(frequency, time + .008, .08)
+      source = osc
+    }
     const filter = ctx.createBiquadFilter()
     const distortion = ctx.createWaveShaper()
     const env = ctx.createGain()
     this.bassEnvelope = env
-    this.bassVoices.set(env, {osc, start: time})
-    osc.onended = () => { this.bassVoices.delete(env); if (this.bassEnvelope === env) this.bassEnvelope = null }
-    osc.type = voice.wave
-    const frequency = 440 * Math.pow(2, (bassMidi(data.root, data.scale, row) - 69) / 12)
-    // CHAOS bends by a small, repeatable number of cents, never a different note.
-    const cents = voice.pitchOffset * (step % 3 - 1)
-    osc.frequency.setValueAtTime(frequency * Math.pow(2, cents / 1200), time)
-    if (cents) osc.frequency.setTargetAtTime(frequency, time + .008, .08)
+    this.bassVoices.set(env, {source, start: time})
+    source.onended = () => { this.bassVoices.delete(env); if (this.bassEnvelope === env) this.bassEnvelope = null }
     filter.type = 'lowpass'
     const cutoff = 110 * Math.pow(22, clamp(data.cutoff)) * voice.cutoff
     filter.frequency.setValueAtTime(cutoff * voice.filterAttack * (accent ? 1.55 : 1), time)
@@ -197,7 +276,7 @@ export class DrumEngine {
     const curve = new Float32Array(1025)
     for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh((i / 512 - 1) * amount) / Math.tanh(amount) * .65
     distortion.curve = curve
-    osc.connect(filter).connect(distortion).connect(env).connect(output)
+    source.connect(filter).connect(distortion).connect(env).connect(output)
     const level = (accent ? .85 : .52) * voice.level
     const decay = (.06 + clamp(data.decay) * .5) * voice.decay
     const attack = Math.min(voice.attack, gate * .45)
@@ -205,8 +284,20 @@ export class DrumEngine {
     env.gain.exponentialRampToValueAtTime(level, time + attack)
     env.gain.setTargetAtTime(level * voice.sustain, time + attack, decay)
     env.gain.setTargetAtTime(.0001, time + gate, .025)
-    osc.start(time)
-    osc.stop(time + gate + .2)
+    try {
+      source.start(time)
+      source.stop(time + gate + .2)
+    } catch (error) {
+      if (!sampledMode || !sample) throw error
+      source.disconnect()
+      this.bassVoices.delete(env)
+      if (this.bassEnvelope === env) this.bassEnvelope = null
+      delete this.bassSamples[sampledMode]
+      const status: BassSampleStatus = {state:'error', file:BASS_SAMPLES[sampledMode].file}
+      this.bassLoads[sampledMode] = Promise.resolve(status)
+      this.onBassSampleError?.(sampledMode, status)
+      this.bassVoice(row, step, time, stepDuration, data)
+    }
   }
 
   private noiseBuffer(ctx: AudioContext) {
@@ -227,6 +318,21 @@ export class DrumEngine {
     const humanAmount = Math.max(0, Math.min(100, human)) / 100
     const velocity = 1 - humanAmount * .5 * Math.random()
     const ghost = style === 'TRIP-HOP' && row === 1 && step !== 4 && step !== 12 ? .42 : 1
+    const sample = style === 'GLITCH' || style === 'TRIP-HOP' ? this.sampleBuffers[style]?.[row] : null
+    if (sample) {
+      const source = ctx.createBufferSource()
+      const gain = ctx.createGain()
+      source.buffer = sample
+      // Short fades avoid discontinuities while retaining each sample's natural tail.
+      const fade = Math.min(.003, sample.duration / 3)
+      gain.gain.setValueAtTime(0, time)
+      gain.gain.linearRampToValueAtTime(voice.level * velocity * ghost, time + fade)
+      gain.gain.setValueAtTime(voice.level * velocity * ghost, time + sample.duration - fade)
+      gain.gain.linearRampToValueAtTime(0, time + sample.duration)
+      source.connect(gain).connect(out)
+      source.start(time)
+      return
+    }
     const env = ctx.createGain()
     if (kit.drive > 0) {
       const distortion = ctx.createWaveShaper()

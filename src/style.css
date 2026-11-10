@@ -7,6 +7,13 @@
 .generation-controls label{display:flex;align-items:center;gap:5px}.generation-controls .seed{width:82px;height:25px;font-size:10px;letter-spacing:.04em}.new-seed{height:25px;padding:0 7px;border:1px solid #151a20;border-radius:3px;background:#3d4650;color:#d4dbe0;font-size:8px;cursor:pointer}.generation-controls>span{color:#78848e;margin-left:auto;text-align:right}.drum .current-step{outline:2px solid #f4f4e9;outline-offset:1px;position:relative;z-index:1}.drum .current-number{color:#fff}.drum .module-footer .knobs{gap:clamp(6px,1.3vw,18px)}
 @media(max-width:850px){.generation-controls>span{display:none}.drum .random-note{font-size:7px}.drum .module-footer .knobs{gap:7px}}
 .drum-help{margin-top:7px;color:#aeb9c2;font-size:9px;line-height:1.45;letter-spacing:.03em}.drum-help summary{cursor:pointer;display:inline-block;color:#ff947e;padding:4px 0}.drum-help p{max-width:66em;margin:4px 0}.drum-help b{color:#efb39f}.drum .random-note{line-height:1.45}
+.kit-status{margin:-3px 0 8px;color:#c3cdd5;font-size:9px;line-height:1.4;letter-spacing:.04em;overflow-wrap:anywhere}.kit-status.ready{color:#acd986}.kit-status.error{color:#ffad91}
+.drum .step-row,.drum .step-numbers{grid-template-columns:45px repeat(16,minmax(0,1fr)) 22px 42px}
+.clear-row{height:22px;padding:0 2px;border:1px solid #46515a;border-radius:3px;background:#1c2228;color:#d5a99e;font-size:8px;letter-spacing:.02em}
+.clear-row:active{color:#fff;border-color:var(--accent)}
+.expanded-view .drum .step-row,.expanded-view .drum .step-numbers{grid-template-columns:65px repeat(16,minmax(0,1fr)) 42px 56px}
+.expanded-view .clear-row{height:clamp(34px,6vh,60px);font-size:10px}
+@media(max-width:850px){.drum .step-row,.drum .step-numbers{grid-template-columns:34px repeat(16,minmax(0,1fr)) 18px 38px}.clear-row{height:22px;font-size:7px}}
 .bass .random:not(:disabled){opacity:1;color:#171b0f;background:var(--accent);border-color:#92a931}
 .bass .current-step{outline:2px solid #f4f4e9;outline-offset:1px;position:relative;z-index:1}.bass .current-number{color:#fff}
 .bass .module-footer .knobs{gap:clamp(6px,1.3vw,18px)}.bass-generation .lcd{max-width:105px}

@@ -22,8 +22,10 @@ for (const style of DRUM_STYLES) {
 }
 const patterns = DRUM_STYLES.map(style => JSON.stringify(generateDrumPattern(style, 'A41F', 30, 55, empty(), [])))
 assert.equal(new Set(patterns).size, DRUM_STYLES.length, 'styles produce distinct patterns')
-assert.notDeepEqual(generateDrumPattern('BROKEN', 'A41F', 0, 55, empty(), []), generateDrumPattern('BROKEN', 'A41F', 100, 55, empty(), []), 'WEIRD changes the pattern')
-assert.notDeepEqual(generateDrumPattern('BROKEN', 'A41F', 30, 10, empty(), []), generateDrumPattern('BROKEN', 'A41F', 30, 90, empty(), []), 'density changes the pattern')
+for (const style of ['BROKEN', 'GLITCH']) {
+  assert.notDeepEqual(generateDrumPattern(style, 'A41F', 0, 55, empty(), []), generateDrumPattern(style, 'A41F', 100, 55, empty(), []), `${style}: WEIRD changes the pattern`)
+  assert.notDeepEqual(generateDrumPattern(style, 'A41F', 30, 10, empty(), []), generateDrumPattern(style, 'A41F', 30, 90, empty(), []), `${style}: density changes the pattern`)
+}
 for (let row = 0; row < 4; row++) {
   const signatures = DRUM_STYLES.map(style => {
     const { level, ...timbre } = DRUM_KITS[style].voices[row]
